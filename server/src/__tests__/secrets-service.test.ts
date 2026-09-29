@@ -1473,6 +1473,50 @@ describeEmbeddedPostgres("secretService", () => {
     });
   });
 
+  it("removeIfUnreferenced keeps a secret that a binding outside the ignored one still references", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `shared-ssh-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "ssh-private-key",
+    });
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "environment", targetId: "env-a" }, [
+      { secretId: secret.id, configPath: "privateKeySecretRef" },
+    ]);
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "environment", targetId: "env-b" }, [
+      { secretId: secret.id, configPath: "privateKeySecretRef" },
+    ]);
+
+    const removed = await svc.removeIfUnreferenced(secret.id, {
+      ignoreBinding: (binding) => binding.targetType === "environment" && binding.targetId === "env-a",
+    });
+
+    expect(removed).toBe(false);
+    expect(await svc.getById(secret.id)).toMatchObject({ id: secret.id, status: "active" });
+    expect(await svc.listBindingReferences(companyId, secret.id)).toHaveLength(2);
+  });
+
+  it("removeIfUnreferenced removes a secret whose only binding is the ignored one", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `own-ssh-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "ssh-private-key",
+    });
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "environment", targetId: "env-a" }, [
+      { secretId: secret.id, configPath: "privateKeySecretRef" },
+    ]);
+
+    const removed = await svc.removeIfUnreferenced(secret.id, {
+      ignoreBinding: (binding) => binding.targetType === "environment" && binding.targetId === "env-a",
+    });
+
+    expect(removed).toBe(true);
+    expect(await svc.getById(secret.id)).toBeNull();
+  });
+
   it("enforces binding context and records value-free access events", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);

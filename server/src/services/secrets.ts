@@ -3373,6 +3373,62 @@ export function secretService(db: Db | DbTransaction) {
     );
   }
 
+  function softDeletedSecretFields(secret: typeof companySecrets.$inferSelect) {
+    return {
+      key: `${secret.key}__deleted__${secret.id}`,
+      name: `${secret.name}__deleted__${secret.id}`,
+      status: "deleted",
+      deletedAt: secret.deletedAt ?? new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  // Deletes a secret only when no binding outside `ignoreBinding` still
+  // references it. The reference check and the soft delete run in one
+  // transaction that holds the secret row `FOR UPDATE`. A binding insert
+  // checks its foreign key with `FOR KEY SHARE` on that same row, so it cannot
+  // commit between the check and the soft delete: a binding that commits first
+  // is seen by the check and keeps the secret, and a later one finds the secret
+  // already deleted, the same as racing an explicit delete. The provider delete
+  // and hard delete then run as in `remove`.
+  async function removeSecretIfUnreferencedInternal(
+    secretId: string,
+    options: {
+      ignoreBinding?: (binding: { targetType: string; targetId: string; configPath: string }) => boolean;
+    } = {},
+  ): Promise<boolean> {
+    const preCheckSecret = await getById(secretId);
+    if (!preCheckSecret || preCheckSecret.status === "deleted") return false;
+    return withAccountHomeSecretMutationLock(undefined, preCheckSecret.companyId, async () => {
+      const claimed = await db.transaction(async (tx) => {
+        const secret = await tx
+          .select()
+          .from(companySecrets)
+          .where(eq(companySecrets.id, secretId))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!secret || secret.status === "deleted") return false;
+        const bindings = await tx
+          .select({
+            targetType: companySecretBindings.targetType,
+            targetId: companySecretBindings.targetId,
+            configPath: companySecretBindings.configPath,
+          })
+          .from(companySecretBindings)
+          .where(eq(companySecretBindings.secretId, secretId));
+        if (bindings.some((binding) => !options.ignoreBinding?.(binding))) return false;
+        await tx
+          .update(companySecrets)
+          .set(softDeletedSecretFields(secret))
+          .where(eq(companySecrets.id, secretId));
+        return true;
+      });
+      if (!claimed) return false;
+      await removeSecretUnlocked(secretId);
+      return true;
+    });
+  }
+
   // The body of `removeSecretInternal` above, unchanged. Extracted to a named
   // function so that wrapper can hold the lock across this whole delete
   // sequence without duplicating it.
@@ -3385,13 +3441,7 @@ export function secretService(db: Db | DbTransaction) {
     if (secret.status !== "deleted") {
       await db
         .update(companySecrets)
-        .set({
-          key: `${secret.key}__deleted__${secret.id}`,
-          name: `${secret.name}__deleted__${secret.id}`,
-          status: "deleted",
-          deletedAt: secret.deletedAt ?? new Date(),
-          updatedAt: new Date(),
-        })
+        .set(softDeletedSecretFields(secret))
         .where(eq(companySecrets.id, secretId));
     }
     const providerConfig = secret.providerConfigId
@@ -5101,6 +5151,8 @@ export function secretService(db: Db | DbTransaction) {
     },
 
     remove: removeSecretInternal,
+
+    removeIfUnreferenced: removeSecretIfUnreferencedInternal,
 
     normalizeAdapterConfigForPersistence: async (
       companyId: string,

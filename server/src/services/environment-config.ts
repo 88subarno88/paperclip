@@ -796,23 +796,16 @@ export function readSshEnvironmentPrivateKeySecretId(
  * uses it. The key can be a shared company secret that other environments and
  * agents bind to, and `managedMode` cannot tell that apart from a secret the
  * environment created itself, so ownership is decided by remaining references.
- * Bindings owned by `environmentId` are ignored because the caller is dropping
- * this environment's reference. Other SSH environments' configs are also
- * checked in case an older environment has no binding row.
+ * Only this environment's own `privateKeySecretRef` binding is ignored, because
+ * the caller is dropping that reference. Its `env.*` bindings still count.
+ * Other SSH environments' configs are also checked in case an older
+ * environment has no binding row.
  */
 export async function removeSshPrivateKeySecretIfUnreferenced(input: {
   db: Db;
   secretId: string;
   environmentId: string | null;
 }): Promise<boolean> {
-  const secrets = secretService(input.db);
-  const secret = await secrets.getById(input.secretId);
-  if (!secret) return false;
-  const bindings = await secrets.listBindingReferences(secret.companyId, input.secretId);
-  const referencedByBinding = bindings.some(
-    (binding) => !(binding.targetType === "environment" && binding.targetId === input.environmentId),
-  );
-  if (referencedByBinding) return false;
   const sshEnvironments = await environmentService(input.db).list({ driver: "ssh" });
   const referencedByEnvironment = sshEnvironments.some(
     (environment) =>
@@ -820,8 +813,12 @@ export async function removeSshPrivateKeySecretIfUnreferenced(input: {
       readSshEnvironmentPrivateKeySecretId(environment) === input.secretId,
   );
   if (referencedByEnvironment) return false;
-  await secrets.remove(input.secretId);
-  return true;
+  return secretService(input.db).removeIfUnreferenced(input.secretId, {
+    ignoreBinding: (binding) =>
+      binding.targetType === "environment" &&
+      binding.targetId === input.environmentId &&
+      binding.configPath === "privateKeySecretRef",
+  });
 }
 
 export function parseEnvironmentDriverConfig(
