@@ -12,6 +12,7 @@ import {
   environments,
   heartbeatRuns,
   issues,
+  managedAgentProfiles,
   projects,
   routines,
   secretAccessEvents,
@@ -3373,26 +3374,18 @@ export function secretService(db: Db | DbTransaction) {
     );
   }
 
-  function softDeletedSecretFields(secret: typeof companySecrets.$inferSelect) {
-    return {
-      key: `${secret.key}__deleted__${secret.id}`,
-      name: `${secret.name}__deleted__${secret.id}`,
-      status: "deleted",
-      deletedAt: secret.deletedAt ?? new Date(),
-      updatedAt: new Date(),
-    };
-  }
-
-  // Deletes a secret only when no binding outside `ignoreBinding` still
-  // references it. The whole removal runs in one transaction that holds the
-  // secret row `FOR UPDATE`. A binding insert checks its foreign key with
-  // `FOR KEY SHARE` on that same row, so it cannot commit between the
-  // reference check and the delete: a binding that commits first is seen by
-  // the check and keeps the secret, and a later one finds the secret gone, the
-  // same as racing an explicit delete. If the provider cleanup fails, the
-  // transaction rolls back, so the row keeps its original key and a retry runs
-  // the whole removal again. The provider call holds the row lock while it
-  // runs; only writers of this one secret wait on it.
+  // Deletes a secret only when nothing still references it: no binding outside
+  // `ignoreBinding`, and no managed-agent profile (whose foreign key restricts
+  // the delete). The check and the row delete run in one transaction that
+  // holds the secret row `FOR UPDATE`. A binding insert checks its foreign key
+  // with `FOR KEY SHARE` on that same row, so it cannot commit between the
+  // check and the delete: a binding that commits first is seen by the check and
+  // keeps the secret, and a later one finds the secret gone, the same as racing
+  // an explicit delete. The row is deleted before the provider cleanup, so a
+  // database failure never leaves an active row whose provider value is gone,
+  // and a provider failure rolls the row back with its original key for a
+  // retry. The provider call holds the row lock while it runs; only writers of
+  // this one secret wait on it.
   async function removeSecretIfUnreferencedInternal(
     secretId: string,
     options: {
@@ -3419,7 +3412,17 @@ export function secretService(db: Db | DbTransaction) {
           .from(companySecretBindings)
           .where(eq(companySecretBindings.secretId, secretId));
         if (bindings.some((binding) => !options.ignoreBinding?.(binding))) return false;
-        await removeSecretUnlocked(secretId, tx);
+        const profile = await tx
+          .select({ id: managedAgentProfiles.id })
+          .from(managedAgentProfiles)
+          .where(eq(managedAgentProfiles.apiKeySecretId, secretId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (profile) return false;
+        const versionRow = await getSecretVersion(secret.id, secret.latestVersion);
+        const provider = getSecretProvider(secret.provider as SecretProvider);
+        await tx.delete(companySecrets).where(eq(companySecrets.id, secretId));
+        await deleteSecretProviderMaterial(secret, versionRow, provider);
         return true;
       }),
     );
@@ -3428,18 +3431,36 @@ export function secretService(db: Db | DbTransaction) {
   // The body of `removeSecretInternal` above, unchanged. Extracted to a named
   // function so that wrapper can hold the lock across this whole delete
   // sequence without duplicating it.
-  async function removeSecretUnlocked(secretId: string, executor: Db | DbTransaction = db) {
-    const secret = await getById(secretId, executor);
+  async function removeSecretUnlocked(secretId: string) {
+    const secret = await getById(secretId);
     if (!secret) return null;
     const versionRow = await getSecretVersion(secret.id, secret.latestVersion);
-    const providerId = secret.provider as SecretProvider;
-    const provider = getSecretProvider(providerId);
+    const provider = getSecretProvider(secret.provider as SecretProvider);
     if (secret.status !== "deleted") {
-      await executor
+      await db
         .update(companySecrets)
-        .set(softDeletedSecretFields(secret))
+        .set({
+          key: `${secret.key}__deleted__${secret.id}`,
+          name: `${secret.name}__deleted__${secret.id}`,
+          status: "deleted",
+          deletedAt: secret.deletedAt ?? new Date(),
+          updatedAt: new Date(),
+        })
         .where(eq(companySecrets.id, secretId));
     }
+    await deleteSecretProviderMaterial(secret, versionRow, provider);
+    await db.delete(companySecrets).where(eq(companySecrets.id, secretId));
+    return secret;
+  }
+
+  // Deletes the provider-side value for `secret`, read before any rename so the
+  // provider sees the original key. A value the provider no longer has is
+  // treated as already deleted.
+  async function deleteSecretProviderMaterial(
+    secret: typeof companySecrets.$inferSelect,
+    versionRow: Awaited<ReturnType<typeof getSecretVersion>>,
+    provider: ReturnType<typeof getSecretProvider>,
+  ) {
     const providerConfig = secret.providerConfigId
       ? await getProviderConfigById(secret.providerConfigId)
       : null;
@@ -3447,28 +3468,25 @@ export function secretService(db: Db | DbTransaction) {
       providerConfig && providerConfig.status !== "disabled" && providerConfig.status !== "coming_soon"
         ? toProviderVaultRuntimeConfig(providerConfig)
         : null;
-    if (!secret.providerConfigId || providerRuntimeConfig) {
-      try {
-        await provider.deleteOrArchive({
-          material: versionRow?.material as Record<string, unknown> | undefined,
-          externalRef: secret.externalRef,
-          providerConfig: providerRuntimeConfig,
-          context: {
-            companyId: secret.companyId,
-            secretKey: secret.key,
-            secretName: secret.name,
-            version: secret.latestVersion,
-          },
-          mode: "delete",
-        });
-      } catch (error) {
-        if (!isSecretProviderClientError(error) || error.code !== "not_found") {
-          throw error;
-        }
+    if (secret.providerConfigId && !providerRuntimeConfig) return;
+    try {
+      await provider.deleteOrArchive({
+        material: versionRow?.material as Record<string, unknown> | undefined,
+        externalRef: secret.externalRef,
+        providerConfig: providerRuntimeConfig,
+        context: {
+          companyId: secret.companyId,
+          secretKey: secret.key,
+          secretName: secret.name,
+          version: secret.latestVersion,
+        },
+        mode: "delete",
+      });
+    } catch (error) {
+      if (!isSecretProviderClientError(error) || error.code !== "not_found") {
+        throw error;
       }
     }
-    await executor.delete(companySecrets).where(eq(companySecrets.id, secretId));
-    return secret;
   }
 
   async function removeUserSecretDefinitionInternal(

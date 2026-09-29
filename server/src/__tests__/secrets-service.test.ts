@@ -18,6 +18,7 @@ import {
   companySecrets,
   createDb,
   heartbeatRuns,
+  managedAgentProfiles,
   secretAccessEvents,
   userSecretDeclarations,
   userSecretDefinitions,
@@ -165,6 +166,7 @@ describeEmbeddedPostgres("secretService", () => {
     await db.delete(userSecretDeclarations);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
+    await db.delete(managedAgentProfiles);
     await db.delete(companySecrets);
     await db.delete(userSecretDefinitions);
     await db.delete(companySecretProviderConfigs);
@@ -1515,6 +1517,31 @@ describeEmbeddedPostgres("secretService", () => {
 
     expect(removed).toBe(true);
     expect(await svc.getById(secret.id)).toBeNull();
+  });
+
+  it("removeIfUnreferenced keeps a secret that a managed-agent profile still uses, without touching the provider", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `profile-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "anthropic-api-key",
+    });
+    await db.insert(managedAgentProfiles).values({
+      companyId,
+      profileKey: "default",
+      displayName: "Default profile",
+      anthropicAgentId: "agent_123",
+      agentVersion: "1",
+      environmentId: "env_123",
+      apiKeySecretId: secret.id,
+    });
+    const deleteOrArchive = vi.spyOn(localEncryptedProvider, "deleteOrArchive");
+
+    await expect(svc.removeIfUnreferenced(secret.id)).resolves.toBe(false);
+
+    expect(deleteOrArchive).not.toHaveBeenCalled();
+    expect(await svc.getById(secret.id)).toMatchObject({ id: secret.id, status: "active" });
   });
 
   it("removeIfUnreferenced rolls back on provider failure and passes the original key on retry", async () => {
