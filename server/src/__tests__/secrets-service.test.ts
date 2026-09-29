@@ -1517,6 +1517,55 @@ describeEmbeddedPostgres("secretService", () => {
     expect(await svc.getById(secret.id)).toBeNull();
   });
 
+  it("removeIfUnreferenced rolls back on provider failure and passes the original key on retry", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const externalRef =
+      "arn:aws:secretsmanager:us-east-1:123456789012:secret:paperclip/prod-use1/company-1/ssh-key";
+    const secret = await db
+      .insert(companySecrets)
+      .values({
+        companyId,
+        key: "ssh-key",
+        name: "SSH Key",
+        provider: "aws_secrets_manager",
+        managedMode: "paperclip_managed",
+        externalRef,
+        latestVersion: 1,
+        status: "active",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    await db.insert(companySecretVersions).values({
+      secretId: secret.id,
+      version: 1,
+      material: {
+        scheme: "aws_secrets_manager_v1",
+        secretId: externalRef,
+        versionId: "aws-version-1",
+        source: "managed",
+      },
+      valueSha256: "value-sha-1",
+      fingerprintSha256: "fingerprint-sha-1",
+      providerVersionRef: "aws-version-1",
+      status: "current",
+    });
+    const deleteOrArchive = vi
+      .spyOn(awsSecretsManagerProvider, "deleteOrArchive")
+      .mockRejectedValueOnce(new Error("provider delete failed"))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(svc.removeIfUnreferenced(secret.id)).rejects.toThrow("provider delete failed");
+    expect(await svc.getById(secret.id)).toMatchObject({ key: "ssh-key", name: "SSH Key", status: "active" });
+
+    await expect(svc.removeIfUnreferenced(secret.id)).resolves.toBe(true);
+    expect(deleteOrArchive).toHaveBeenCalledTimes(2);
+    for (const [call] of deleteOrArchive.mock.calls) {
+      expect(call.context).toMatchObject({ secretKey: "ssh-key", secretName: "SSH Key" });
+    }
+    expect(await svc.getById(secret.id)).toBeNull();
+  });
+
   it("enforces binding context and records value-free access events", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);

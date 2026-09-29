@@ -3384,13 +3384,15 @@ export function secretService(db: Db | DbTransaction) {
   }
 
   // Deletes a secret only when no binding outside `ignoreBinding` still
-  // references it. The reference check and the soft delete run in one
-  // transaction that holds the secret row `FOR UPDATE`. A binding insert
-  // checks its foreign key with `FOR KEY SHARE` on that same row, so it cannot
-  // commit between the check and the soft delete: a binding that commits first
-  // is seen by the check and keeps the secret, and a later one finds the secret
-  // already deleted, the same as racing an explicit delete. The provider delete
-  // and hard delete then run as in `remove`.
+  // references it. The whole removal runs in one transaction that holds the
+  // secret row `FOR UPDATE`. A binding insert checks its foreign key with
+  // `FOR KEY SHARE` on that same row, so it cannot commit between the
+  // reference check and the delete: a binding that commits first is seen by
+  // the check and keeps the secret, and a later one finds the secret gone, the
+  // same as racing an explicit delete. If the provider cleanup fails, the
+  // transaction rolls back, so the row keeps its original key and a retry runs
+  // the whole removal again. The provider call holds the row lock while it
+  // runs; only writers of this one secret wait on it.
   async function removeSecretIfUnreferencedInternal(
     secretId: string,
     options: {
@@ -3398,16 +3400,16 @@ export function secretService(db: Db | DbTransaction) {
     } = {},
   ): Promise<boolean> {
     const preCheckSecret = await getById(secretId);
-    if (!preCheckSecret || preCheckSecret.status === "deleted") return false;
-    return withAccountHomeSecretMutationLock(undefined, preCheckSecret.companyId, async () => {
-      const claimed = await db.transaction(async (tx) => {
+    if (!preCheckSecret) return false;
+    return withAccountHomeSecretMutationLock(undefined, preCheckSecret.companyId, () =>
+      db.transaction(async (tx) => {
         const secret = await tx
           .select()
           .from(companySecrets)
           .where(eq(companySecrets.id, secretId))
           .for("update")
           .then((rows) => rows[0] ?? null);
-        if (!secret || secret.status === "deleted") return false;
+        if (!secret) return false;
         const bindings = await tx
           .select({
             targetType: companySecretBindings.targetType,
@@ -3417,29 +3419,23 @@ export function secretService(db: Db | DbTransaction) {
           .from(companySecretBindings)
           .where(eq(companySecretBindings.secretId, secretId));
         if (bindings.some((binding) => !options.ignoreBinding?.(binding))) return false;
-        await tx
-          .update(companySecrets)
-          .set(softDeletedSecretFields(secret))
-          .where(eq(companySecrets.id, secretId));
+        await removeSecretUnlocked(secretId, tx);
         return true;
-      });
-      if (!claimed) return false;
-      await removeSecretUnlocked(secretId);
-      return true;
-    });
+      }),
+    );
   }
 
   // The body of `removeSecretInternal` above, unchanged. Extracted to a named
   // function so that wrapper can hold the lock across this whole delete
   // sequence without duplicating it.
-  async function removeSecretUnlocked(secretId: string) {
-    const secret = await getById(secretId);
+  async function removeSecretUnlocked(secretId: string, executor: Db | DbTransaction = db) {
+    const secret = await getById(secretId, executor);
     if (!secret) return null;
     const versionRow = await getSecretVersion(secret.id, secret.latestVersion);
     const providerId = secret.provider as SecretProvider;
     const provider = getSecretProvider(providerId);
     if (secret.status !== "deleted") {
-      await db
+      await executor
         .update(companySecrets)
         .set(softDeletedSecretFields(secret))
         .where(eq(companySecrets.id, secretId));
@@ -3471,7 +3467,7 @@ export function secretService(db: Db | DbTransaction) {
         }
       }
     }
-    await db.delete(companySecrets).where(eq(companySecrets.id, secretId));
+    await executor.delete(companySecrets).where(eq(companySecrets.id, secretId));
     return secret;
   }
 
